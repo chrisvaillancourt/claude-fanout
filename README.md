@@ -7,7 +7,7 @@ A subagent starts by loading a system prompt, tool schemas, CLAUDE.md and memory
 ## Behavior
 
 - **`mcp__fanout__complete`**: one instruction applied to each item. Replies are free text, or JSON checked against a small JSON Schema subset you pass in.
-- **`mcp__fanout__classify`**: one label per item from a fixed list, with an optional one-line reason.
+- **`mcp__fanout__classify`**: one label per item from a fixed list (2 to 50 labels), with an optional one-sentence reason (cut to 300 characters, marked with …).
 - Both are for items that are independent and self-contained, get the same instructions, and need no tools, files or knowledge of the other items. They are not for work that needs repository access, multi-step reasoning, or comparing items with each other.
 - Every request opens with the same text (framing, your instructions, the output format), marked for the prompt cache; the item follows. Item text is framed as data to work on, never instructions to follow.
 - Up to `concurrency` requests run at once, shared across every call in the session, main conversation and subagents alike.

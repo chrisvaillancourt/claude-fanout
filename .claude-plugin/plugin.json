@@ -7,8 +7,79 @@
     "enabled": {
       "type": "boolean",
       "title": "Enabled",
-      "description": "Turn the mod on for new sessions. /fanout on|off overrides it for a session.",
+      "description": "Register the fanout tools in new sessions. /fanout on|off overrides it for a session.",
       "default": true
+    },
+    "model": {
+      "type": "string",
+      "title": "Model",
+      "description": "Model for each item, as a full model id.",
+      "default": "claude-haiku-5-5"
+    },
+    "models": {
+      "type": "string",
+      "title": "Allowed models",
+      "description": "Comma-separated model ids a call may choose. The default model is always allowed.",
+      "default": "claude-haiku-5-5,claude-sonnet-5-5"
+    },
+    "effort": {
+      "type": "string",
+      "title": "Effort",
+      "description": "Effort for each request.",
+      "default": "low",
+      "options": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "concurrency": {
+      "type": "number",
+      "title": "Concurrency",
+      "description": "Requests in flight at once across the session (1 to 16).",
+      "default": 8
+    },
+    "maxItems": {
+      "type": "number",
+      "title": "Max items per call",
+      "description": "Most items one call may carry (1 to 1000). Above it the call is refused.",
+      "default": 200
+    },
+    "maxItemChars": {
+      "type": "number",
+      "title": "Max item characters",
+      "description": "Longest item (100 to 100000). Above it the call is refused.",
+      "default": 8000
+    },
+    "maxInstructionChars": {
+      "type": "number",
+      "title": "Max instruction characters",
+      "description": "Longest shared instruction (100 to 100000).",
+      "default": 8000
+    },
+    "maxTokens": {
+      "type": "number",
+      "title": "Reply cap",
+      "description": "Reply token cap for complete items (16 to 8192). Classify uses 128, or 256 with reasons.",
+      "default": 1024
+    },
+    "timeoutSeconds": {
+      "type": "number",
+      "title": "Request timeout (s)",
+      "description": "Time limit for each request (5 to 600).",
+      "default": 60
+    },
+    "inlineResultChars": {
+      "type": "number",
+      "title": "Inline result size",
+      "description": "Largest result returned inline, in characters (1000 to 200000); above it the full results go to a file.",
+      "default": 12000
+    },
+    "alwaysLoaded": {
+      "type": "boolean",
+      "title": "Always loaded",
+      "description": "Put the tools schemas in every request instead of behind ToolSearch.",
+      "default": false
     }
   },
   "author": {
