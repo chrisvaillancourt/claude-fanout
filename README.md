@@ -7,13 +7,13 @@ A subagent starts by loading a system prompt, tool schemas, CLAUDE.md and memory
 ## Behavior
 
 - **`mcp__fanout__complete`**: one instruction applied to each item. Replies are free text, or JSON checked against a small JSON Schema subset you pass in.
-- **`mcp__fanout__classify`**: one label per item from a fixed list (2 to 50 labels), with an optional one-sentence reason (cut to 300 characters, marked with …).
+- **`mcp__fanout__classify`**: one label per item from a fixed list (2 to 50 labels), with an optional one-sentence reason (cut to 300 characters, marked with …). The reply's first line must name a label: an exact match wins, then a match ignoring case, then one ignoring markdown and punctuation; a loose match that fits two labels fails the item. With `reason: true`, a reply that gives a label but no reason is invalid and is retried once.
 - Both are for items that are independent and self-contained, get the same instructions, and need no tools, files or knowledge of the other items. They are not for work that needs repository access, multi-step reasoning, or comparing items with each other.
 - Every request opens with the same text (framing, your instructions, the output format), marked for the prompt cache; the item follows. Item text is framed as data to work on, never instructions to follow.
 - Up to `concurrency` requests run at once, shared across every call in the session, main conversation and subagents alike.
 - A failed item (API error, timeout, empty reply, a label not in the list, JSON that fails the schema) is reported as failed for that item; the rest of the call goes on. Each item is retried at most once. Errors that won't clear on retry (authentication, billing, invalid request, unknown model) are not retried. Pressing Esc cancels the call: running requests are cut, unstarted items are reported as `cancelled`.
 - Above the limits (`maxItems`, `maxItemChars`, a model not in `models`, an unsupported schema keyword, duplicate ids or labels) the call is refused before any request is made. Nothing is truncated silently.
-- The result is a compact list: one line per item. If it would exceed `inlineResultChars`, the full results go to a JSONL file under `$TMPDIR/claude-fanout/<session id>/` and the result gives the path, the counts and the failed items. Reading that file may raise a permission prompt, since it is outside the project.
+- The result is a compact list: one line per item. JSON results are always shown serialized, so the string `"null"` and the value `null` stay distinct; text results are shown raw unless a newline, tab or leading quote makes them ambiguous, in which case they are shown as a JSON string. If it would exceed `inlineResultChars`, the full results go to a JSONL file under `$TMPDIR/claude-fanout/<session id>/` and the result gives the path, the counts and the failed items. Reading that file may raise a permission prompt, since it is outside the project.
 - Every result ends with the counts (ok, failed, retried), the model, the time taken and the token usage from every attempt, failed ones included: input, cache read, cache write, output, and tokens per item.
 
 ### What it costs
@@ -47,7 +47,7 @@ Tool loading. The two tools are deferred behind ToolSearch by default, so each r
 | `concurrency` | `8` | Requests in flight at once across the session (1 to 16). |
 | `maxItems` | `200` | Most items one call may carry (1 to 1000). |
 | `maxItemChars` | `8000` | Longest item, in characters (100 to 100000). |
-| `maxInstructionChars` | `8000` | Longest shared instruction, in characters. |
+| `maxInstructionChars` | `8000` | Longest shared block, in characters: the instructions plus the output format (the JSON schema or the label list), which every request repeats. |
 | `maxTokens` | `1024` | Reply cap for `complete` items (16 to 8192). Classify uses 128, or 256 with reasons. |
 | `timeoutSeconds` | `60` | Time limit for each request (5 to 600). |
 | `inlineResultChars` | `12000` | Largest result returned inline; above it the results are written to a file. |
@@ -55,8 +55,8 @@ Tool loading. The two tools are deferred behind ToolSearch by default, so each r
 
 ## Limitations
 
-- Items are passed inline, so their text enters the conversation once, as the tool call's input. There is no file input: a tool that reads files on the model's behalf would sidestep the session's Read permissions.
-- JSON output is prompted and then checked locally against a schema subset (`type`, `properties`, `required`, `items`, `enum`, `additionalProperties: false`, `description`); other keywords are refused. There is no forced-tool structured output.
+- Items are passed inline, so their text enters the conversation once, as the tool call's input. There is no file input: a tool that reads files on the model's behalf would sidestep the session's Read permissions. A later version could add it, gated on the session allowing a Read of the same path (`$.tool.check`).
+- JSON output is prompted and then checked locally against a schema subset (`type`, `properties`, `required`, `items`, `enum`, `additionalProperties: false`, `description`); other keywords are refused. Object members are checked as own JSON members (`constructor` or `__proto__` keys get no special treatment) and `enum` compares JSON structurally (object member order doesn't matter). There is no forced-tool structured output.
 - No per-label confidence: the model names a label, it doesn't give probabilities.
 - No background runs or resume: a call runs to the end inside its tool call. A hot reload or Esc cancels it.
 - No `jevify`-style keyword or frozen-rubric workflow; the tool descriptions carry the guidance.

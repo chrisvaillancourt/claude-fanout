@@ -189,7 +189,7 @@ async function runJob($: EngineInterface, job: Job, signal: AbortSignal): Promis
   if (shouldWarm(job)) await worker(true)
   await Promise.all(Array.from({ length: Math.min(config.concurrency, job.items.length) }, () => worker()))
   const done = rows.map((r, i) => r ?? { id: job.items[i]!.id, ok: false as const, error: 'cancelled', attempts: attempts[i]! })
-  return { tool: job.tool, model: job.model, ms: Date.now() - started, requests, usage, rows: done }
+  return { tool: job.tool, format: job.format, model: job.model, ms: Date.now() - started, requests, usage, rows: done }
 }
 
 /** The result text, spilling the full rows to a file when they don't fit. */

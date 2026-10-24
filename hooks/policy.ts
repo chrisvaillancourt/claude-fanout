@@ -163,7 +163,19 @@ export function validateComplete(input: Record<string, unknown>, config: Config)
   } else if (input.schema !== undefined) {
     return fail('schema needs format: json.')
   }
-  return { ok: true, job: { tool: 'complete', model: c.model, instructions: c.instructions, items: c.items, format, schema, labels: [], reasons: false, maxTokens: config.maxTokens } }
+  return capShared({ tool: 'complete', model: c.model, instructions: c.instructions, items: c.items, format, schema, labels: [], reasons: false, maxTokens: config.maxTokens }, config)
+}
+
+/** Instructions plus the output contract (schema or labels): what every request repeats. */
+export function sharedChars(job: Job): number {
+  return job.instructions.length + contract(job).length
+}
+
+function capShared(job: Job, config: Config): Checked {
+  const n = sharedChars(job)
+  if (n > config.maxInstructionChars)
+    return fail(`instructions plus the output format (schema or labels) is ${n} characters; the limit is ${config.maxInstructionChars} (maxInstructionChars). Nothing was sent.`)
+  return { ok: true, job }
 }
 
 export function validateClassify(input: Record<string, unknown>, config: Config): Checked {
@@ -184,10 +196,10 @@ export function validateClassify(input: Record<string, unknown>, config: Config)
     labels.push(label)
   }
   const reasons = input.reason === true
-  return {
-    ok: true,
-    job: { tool: 'classify', model: c.model, instructions: c.instructions, items: c.items, format: 'text', labels, reasons, maxTokens: reasons ? CLASSIFY_REASON_TOKENS : CLASSIFY_TOKENS },
-  }
+  return capShared(
+    { tool: 'classify', model: c.model, instructions: c.instructions, items: c.items, format: 'text', labels, reasons, maxTokens: reasons ? CLASSIFY_REASON_TOKENS : CLASSIFY_TOKENS },
+    config,
+  )
 }
 
 // ---------------------------------------------------------------- schema subset
@@ -233,6 +245,19 @@ function typeOf(v: unknown): string {
   return typeof v
 }
 
+/** JSON equality: object members in any order, array elements in order. */
+export function jsonEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => jsonEqual(x, b[i]))
+  }
+  if (isObject(a) && isObject(b)) {
+    const ka = Object.keys(a)
+    return ka.length === Object.keys(b).length && ka.every(k => Object.hasOwn(b, k) && jsonEqual(a[k], b[k]))
+  }
+  return false
+}
+
 /** Why `v` doesn't match the (subset) schema, or null when it does. */
 export function matchesSchema(v: unknown, s: Record<string, unknown>, path = '$'): string | null {
   if (s.type !== undefined) {
@@ -241,13 +266,13 @@ export function matchesSchema(v: unknown, s: Record<string, unknown>, path = '$'
     const okType = types.includes(t) || (t === 'integer' && types.includes('number'))
     if (!okType) return `${path} is ${t}, expected ${types.join(' or ')}`
   }
-  if (Array.isArray(s.enum) && !s.enum.some(e => JSON.stringify(e) === JSON.stringify(v)))
+  if (Array.isArray(s.enum) && !s.enum.some(e => jsonEqual(e, v)))
     return `${path} is not one of ${JSON.stringify(s.enum)}`
   if (isObject(v)) {
     const props = isObject(s.properties) ? s.properties : {}
-    for (const r of (s.required as string[] | undefined) ?? []) if (!(r in v)) return `${path}: missing required ${r}`
+    for (const r of (s.required as string[] | undefined) ?? []) if (!Object.hasOwn(v, r)) return `${path}: missing required ${r}`
     for (const [k, val] of Object.entries(v)) {
-      const sub = props[k]
+      const sub = Object.hasOwn(props, k) ? props[k] : undefined
       if (isObject(sub)) {
         const bad = matchesSchema(val, sub, `${path}.${k}`)
         if (bad) return bad
@@ -324,17 +349,34 @@ function bare(line: string): string {
     .toLowerCase()
 }
 
+/**
+ * The label a reply's first line names: an exact match first, then one that
+ * differs only in case, then one that matches once markup and punctuation are
+ * stripped from both. A loose match that fits more than one label is refused.
+ */
+export function matchLabel(labels: readonly string[], line: string): Parsed {
+  const t = line.trim()
+  const exact = labels.find(l => l === t)
+  if (exact !== undefined) return { ok: true, value: exact }
+  for (const norm of [(x: string) => x.trim().toLowerCase(), bare]) {
+    const hits = labels.filter(l => norm(l) === norm(t))
+    if (hits.length === 1) return { ok: true, value: hits[0]! }
+    if (hits.length > 1) return { ok: false, error: `reply is ambiguous between labels ${hits.join(', ')}: ${oneLine(t, 80)}` }
+  }
+  return { ok: false, error: `reply named no label: ${oneLine(t, 80)}` }
+}
+
 export function parseReply(job: Job, text: string): Parsed {
   const trimmed = text.trim()
   if (trimmed === '') return { ok: false, error: 'empty reply' }
   if (job.tool === 'classify') {
     const lines = trimmed.split(/\r?\n/).filter(l => l.trim() !== '')
-    const first = bare(lines[0] ?? '')
-    const label = job.labels.find(l => l.toLowerCase() === first)
-    if (label === undefined) return { ok: false, error: `reply named no label: ${oneLine(lines[0] ?? '', 80)}` }
+    const picked = matchLabel(job.labels, lines[0] ?? '')
+    if (!picked.ok) return picked
+    const label = picked.value as string
     if (!job.reasons) return { ok: true, value: label }
     const reason = oneLine(lines.slice(1).join(' ').replace(/^\s*reason\s*:\s*/i, ''), MAX_REASON_CHARS)
-    return reason === '' ? { ok: true, value: label } : { ok: true, value: label, reason }
+    return reason === '' ? { ok: false, error: 'reply gave a label but no reason' } : { ok: true, value: label, reason }
   }
   if (job.format === 'json') {
     const fenced = /^```[a-zA-Z]*\n([\s\S]*)\n```$/.exec(trimmed)
@@ -405,7 +447,7 @@ export type Row =
   | { id: string; ok: true; value: unknown; reason?: string; attempts: number }
   | { id: string; ok: false; error: string; attempts: number }
 
-export type Run = { tool: 'complete' | 'classify'; model: string; ms: number; requests: number; usage: Usage; rows: Row[] }
+export type Run = { tool: 'complete' | 'classify'; format: 'text' | 'json'; model: string; ms: number; requests: number; usage: Usage; rows: Row[] }
 
 export type Counts = { items: number; ok: number; failed: number; retried: number; cancelled: number }
 
@@ -426,9 +468,12 @@ export function statusOf(c: Counts): 'ok' | 'partial' | 'failed' | 'cancelled' {
   return c.failed > 0 ? 'partial' : 'ok'
 }
 
-function rowLine(r: Row): string {
+function rowLine(r: Row, format: 'text' | 'json'): string {
   if (!r.ok) return `${r.id}\tFAILED\t${r.error}`
-  const v = typeof r.value === 'string' ? (r.value.includes('\n') || r.value.includes('\t') ? JSON.stringify(r.value) : r.value) : JSON.stringify(r.value)
+  // JSON results are always serialized, so a string stays distinguishable from null or 123.
+  // Text and labels are raw, unless a newline, tab or leading quote would make them ambiguous.
+  const raw = typeof r.value === 'string' && format === 'text' && !/[\n\t\r]|^"/.test(r.value)
+  const v = raw ? (r.value as string) : JSON.stringify(r.value)
   return r.reason ? `${r.id}\t${v}\t${r.reason}` : `${r.id}\t${v}`
 }
 
@@ -450,8 +495,8 @@ export function formatResult(run: Run, budget: number): Formatted {
     `fanout ${run.tool}: status ${statusOf(c)}: ${c.items} items, ${c.ok} ok, ${c.failed} failed, ${c.retried} retried` +
     `${c.cancelled ? ` (${c.cancelled} cancelled)` : ''}. Model ${run.model}, ${(run.ms / 1000).toFixed(1)}s.\n` +
     `Tokens: ${usageLine(run.usage, c.items, run.requests)}.\n`
-  const legend = run.tool === 'classify' ? 'id\tlabel' : 'id\tresult'
-  const lines = run.rows.map(rowLine)
+  const legend = run.tool === 'classify' ? 'id\tlabel' : run.format === 'json' ? 'id\tresult (JSON)' : 'id\tresult'
+  const lines = run.rows.map(r => rowLine(r, run.format))
   const text = `${header}${legend}\n${lines.join('\n')}`
   const jsonl = run.rows.map(r => JSON.stringify(r)).join('\n') + '\n'
 
@@ -466,7 +511,7 @@ export function formatResult(run: Run, budget: number): Formatted {
     const left = candidates.length - shown
     return left > 0 ? `${out}${left} ${what} left out.` : out.trimEnd()
   }
-  const failedLines = run.rows.filter(r => !r.ok).map(rowLine)
+  const failedLines = run.rows.filter(r => !r.ok).map(r => rowLine(r, run.format))
   return {
     spill: text.length > budget,
     text,

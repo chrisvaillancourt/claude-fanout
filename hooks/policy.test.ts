@@ -166,7 +166,7 @@ describe('parsing replies', () => {
 
   test('a label is matched loosely and returned as given', async () => {
     expect(parseReply(classify.job, '**Not Spam**\nReason: it is a receipt.')).toEqual({ ok: true, value: 'not spam', reason: 'it is a receipt.' })
-    expect(parseReply(classify.job, '"spam".')).toEqual({ ok: true, value: 'spam' })
+    expect(parseReply(classify.job, '"spam".\nbecause it sells pills')).toEqual({ ok: true, value: 'spam', reason: 'because it sells pills' })
     expect(parseReply(classify.job, 'maybe')).toEqual({ ok: false, error: 'reply named no label: maybe' })
   })
 
@@ -207,7 +207,7 @@ describe('results', () => {
     { id: 'b', ok: true, value: 'ham', attempts: 2 },
     { id: 'c', ok: false, error: 'api-error overloaded (529)', attempts: 2 },
   ]
-  const run = { tool: 'classify' as const, model: 'claude-haiku-5-5', ms: 1500, requests: 5,
+  const run = { tool: 'classify' as const, format: 'text' as const, model: 'claude-haiku-5-5', ms: 1500, requests: 5,
     usage: { input_tokens: 300, output_tokens: 30, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }
 
   test('inline: header with counts and usage, one line per item', async () => {
@@ -241,5 +241,59 @@ describe('results', () => {
     expect(failed).toContain('Could not write the full results to a file (disk full)')
     expect(failed).toMatch(/\d+ rows left out/)
     expect(failed.length).toBeLessThan(800)
+  })
+})
+
+describe('review round 1', () => {
+  const job = (input: Record<string, unknown>, classify = false) => {
+    const r = (classify ? validateClassify : validateComplete)({ instructions: 'Apply the task.', items: ['input'], ...input }, config)
+    if (!r.ok) throw new Error(r.error)
+    return r.job
+  }
+
+  test('required and declared properties use own members only', async () => {
+    const j = job({ format: 'json', schema: { type: 'object', properties: { constructor: { type: 'string' } }, required: ['constructor'] } })
+    expect(parseReply(j, '{}').ok).toBe(false)
+    expect(parseReply(j, '{"constructor":"x"}').ok).toBe(true)
+    const closed = job({ format: 'json', schema: { type: 'object', additionalProperties: false } })
+    expect(parseReply(closed, '{"__proto__":42}').ok).toBe(false)
+    expect(parseReply(closed, '{"toString":1}').ok).toBe(false)
+  })
+
+  test('an exact label wins; a loose match must be unambiguous', async () => {
+    expect(parseReply(job({ labels: ['ok', 'ok.'] }, true), 'ok.')).toEqual({ ok: true, value: 'ok.' })
+    expect(parseReply(job({ labels: ['ok', 'ok.'] }, true), 'ok')).toEqual({ ok: true, value: 'ok' })
+    expect(parseReply(job({ labels: ['ok.', 'no'] }, true), 'ok.')).toEqual({ ok: true, value: 'ok.' })
+    expect(parseReply(job({ labels: ['ok', 'ok.'] }, true), '**OK**')).toEqual({ ok: false, error: expect.stringContaining('ambiguous') })
+    expect(parseReply(job({ labels: ['ok.', 'no'] }, true), '**ok**')).toEqual({ ok: true, value: 'ok.' })
+  })
+
+  test('JSON values keep their type inline: strings are quoted', async () => {
+    const j = job({ format: 'json', schema: { type: 'string' } })
+    const p = parseReply(j, '"null"')
+    if (!p.ok) throw new Error(p.error)
+    const f = formatResult({ tool: 'complete', format: 'json', model: j.model, ms: 0, requests: 1, usage: ZERO, rows: [{ id: '1', ok: true, value: p.value, attempts: 1 }, { id: '2', ok: true, value: null, attempts: 1 }] }, 12000)
+    expect(f.text).toContain('1\t"null"')
+    expect(f.text).toContain('2\tnull')
+    const t = formatResult({ tool: 'complete', format: 'text', model: j.model, ms: 0, requests: 1, usage: ZERO, rows: [{ id: '1', ok: true, value: 'null', attempts: 1 }] }, 12000)
+    expect(t.text).toContain('1\tnull')
+  })
+
+  test('enum compares JSON structurally', async () => {
+    const j = job({ format: 'json', schema: { enum: [{ a: 1, b: [1, { c: 2, d: 3 }] }] } })
+    expect(parseReply(j, '{"b":[1,{"d":3,"c":2}],"a":1}')).toEqual({ ok: true, value: { b: [1, { d: 3, c: 2 }], a: 1 } })
+    expect(parseReply(j, '{"a":1,"b":[{"c":2,"d":3},1]}').ok).toBe(false)
+    expect(parseReply(j, '{"a":1,"b":[1,{"c":2,"d":3}],"e":0}').ok).toBe(false)
+  })
+
+  test('the shared block, schema and labels included, is capped before anything is sent', async () => {
+    const r = validateComplete({ instructions: 'x', items: ['a'], format: 'json', schema: { type: 'string', description: 'x'.repeat(100000) } }, config)
+    expect(r).toEqual({ ok: false, error: expect.stringContaining('the limit is 8000 (maxInstructionChars)') })
+    const labels = Array.from({ length: 50 }, (_, i) => `${'l'.repeat(95)}${i}`)
+    expect(validateClassify({ instructions: 'x'.repeat(4000), items: ['a'], labels }, config).ok).toBe(false)
+  })
+
+  test('with reason requested, a label-only reply is invalid (and so retried)', async () => {
+    expect(parseReply(job({ labels: ['yes', 'no'], reason: true }, true), 'yes')).toEqual({ ok: false, error: 'reply gave a label but no reason' })
   })
 })
