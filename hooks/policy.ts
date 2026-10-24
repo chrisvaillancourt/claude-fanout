@@ -337,6 +337,15 @@ export function shouldWarm(job: Job): boolean {
   return job.items.length > 1 && first !== undefined && buildPrompt(job, first).prompt[0]!.text.length >= WARM_MIN_CHARS
 }
 
+/**
+ * Whether a call may start another request. A call with none in flight always may,
+ * so it never waits; past that it stays under its own `limit` and the session's `cap`.
+ */
+export function canStart(callInFlight: number, sessionInFlight: number, limit: number, cap: number): boolean {
+  if (callInFlight === 0) return true
+  return callInFlight < limit && sessionInFlight < cap
+}
+
 // ---------------------------------------------------------------- replies
 
 export type Parsed = { ok: true; value: unknown; reason?: string } | { ok: false; error: string }

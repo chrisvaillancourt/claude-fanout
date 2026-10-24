@@ -14,6 +14,7 @@ import {
   isActive,
   isRetryable,
   parseArgs,
+  canStart,
   parseReply,
   shouldWarm,
   statusOf,
@@ -38,23 +39,14 @@ const sessionAtom = atom({ plugin: 'fanout', key: 'session' } as const, EMPTY_SE
 let config: Config = configFrom({})
 let registered = false
 
-// One limiter for the whole session: every call, main conversation and subagents.
-let inFlight = 0
-const waiting: (() => void)[] = []
-
-function acquire(): Promise<void> {
-  if (inFlight < config.concurrency) {
-    inFlight++
-    return Promise.resolve()
-  }
-  return new Promise(resolve => waiting.push(resolve))
-}
-
-function release() {
-  const nextWaiter = waiting.shift()
-  if (nextWaiter) nextWaiter()
-  else inFlight--
-}
+// Requests in flight across the session: every call, main conversation and subagents.
+// No call ever waits on this: a hook's wait on a local promise is its own time and the
+// engine ends a hook after 10 s of it. While a `$.model.complete` of the call is in flight
+// the hook's clock is stopped, so each call keeps at least one request going while it has
+// work, and the session cap only limits how many more it may add (canStart).
+let sessionInFlight = 0
+// Each running call's pump, woken when another call's request ends and frees a slot.
+const pumps = new Set<() => void>()
 
 /** Best effort: reporting must never throw out of a hook. */
 function log($: EngineInterface, text: string) {
@@ -127,69 +119,98 @@ function failureOf(r: ModelCompleteResult, cancelled: boolean): Failure | null {
   return cancelled ? { kind: 'cancelled' } : { kind: 'timeout' }
 }
 
-/** Runs every item of `job` through the shared limiter; each item settles to exactly one row. */
-async function runJob($: EngineInterface, job: Job, signal: AbortSignal): Promise<Run> {
-  const started = Date.now()
-  const rows: (Row | undefined)[] = job.items.map(() => undefined)
-  const attempts = job.items.map(() => 0)
-  const queue = job.items.map((_, i) => i)
-  let usage: Usage = ZERO
-  let requests = 0
+type Outcome = { row: Row } | { retry: true }
 
-  // `once`: take one item and stop (the warm-up request).
-  const worker = async (once = false) => {
-    for (let taken = 0; !(once && taken > 0); taken++) {
-      const i = queue.shift()
-      if (i === undefined) return
-      await acquire()
-      try {
-        if (signal.aborted) {
-          rows[i] = { id: job.items[i]!.id, ok: false, error: 'cancelled', attempts: attempts[i]! }
-          continue
-        }
-        const item = job.items[i]!
-        const p = buildPrompt(job, item)
-        attempts[i]!++
-        requests++
-        let r: ModelCompleteResult
-        try {
-          r = await $.model.complete(
-            { model: job.model, system: p.system, prompt: p.prompt, maxTokens: job.maxTokens, effort: config.effort, timeoutMs: config.timeoutMs },
-            { signal },
-          )
-        } catch (err) {
-          // The engine refused to send it (a blocked model, a bad cap): no retry will help.
-          rows[i] = { id: item.id, ok: false, error: `refused: ${err instanceof Error ? err.message : String(err)}`, attempts: attempts[i]! }
-          continue
-        }
-        usage = addUsage(usage, r.usage)
-        let failure = failureOf(r, signal.aborted)
-        if (r.isAnswered) {
-          const parsed = parseReply(job, r.text)
-          if (parsed.ok) {
-            rows[i] = parsed.reason === undefined
-              ? { id: item.id, ok: true, value: parsed.value, attempts: attempts[i]! }
-              : { id: item.id, ok: true, value: parsed.value, reason: parsed.reason, attempts: attempts[i]! }
-            continue
-          }
-          failure = { kind: 'invalid', error: parsed.error }
-        }
-        if (failure && isRetryable(failure) && attempts[i]! < 2 && !signal.aborted) {
-          queue.push(i)
-          continue
-        }
-        rows[i] = { id: item.id, ok: false, error: describeFailure(failure ?? { kind: 'cancelled' }), attempts: attempts[i]! }
-      } finally {
-        release()
+/** One attempt at item `i`: a row when the item is settled, or `retry` to queue it again. */
+async function attempt($: EngineInterface, job: Job, i: number, tries: number, signal: AbortSignal, spend: (u: Usage) => void): Promise<Outcome> {
+  const item = job.items[i]!
+  const p = buildPrompt(job, item)
+  let r: ModelCompleteResult
+  try {
+    r = await $.model.complete(
+      { model: job.model, system: p.system, prompt: p.prompt, maxTokens: job.maxTokens, effort: config.effort, timeoutMs: config.timeoutMs },
+      { signal },
+    )
+  } catch (err) {
+    // The engine refused to send it (a blocked model, a bad cap): no retry will help.
+    return { row: { id: item.id, ok: false, error: `refused: ${err instanceof Error ? err.message : String(err)}`, attempts: tries } }
+  }
+  spend(r.usage)
+  let failure = failureOf(r, signal.aborted)
+  if (r.isAnswered) {
+    const parsed = parseReply(job, r.text)
+    if (parsed.ok) {
+      return {
+        row: parsed.reason === undefined
+          ? { id: item.id, ok: true, value: parsed.value, attempts: tries }
+          : { id: item.id, ok: true, value: parsed.value, reason: parsed.reason, attempts: tries },
       }
     }
+    failure = { kind: 'invalid', error: parsed.error }
   }
+  if (failure && isRetryable(failure) && tries < 2 && !signal.aborted) return { retry: true }
+  return { row: { id: item.id, ok: false, error: describeFailure(failure ?? { kind: 'cancelled' }), attempts: tries } }
+}
 
-  // Parallel cold requests each write the cache; one request first lets the rest read it.
-  if (shouldWarm(job)) await worker(true)
-  await Promise.all(Array.from({ length: Math.min(config.concurrency, job.items.length) }, () => worker()))
-  const done = rows.map((r, i) => r ?? { id: job.items[i]!.id, ok: false as const, error: 'cancelled', attempts: attempts[i]! })
-  return { tool: job.tool, format: job.format, model: job.model, ms: Date.now() - started, requests, usage, rows: done }
+/** Runs every item of `job`; each item settles to exactly one row. Never waits outside a `$` call. */
+function runJob($: EngineInterface, job: Job, signal: AbortSignal): Promise<Run> {
+  return new Promise(resolve => {
+    const started = Date.now()
+    const rows: (Row | undefined)[] = job.items.map(() => undefined)
+    const attempts = job.items.map(() => 0)
+    const queue = job.items.map((_, i) => i)
+    let usage: Usage = ZERO
+    let requests = 0
+    let callInFlight = 0
+    // Parallel cold requests each write the cache; one request first lets the rest read it.
+    let warming = shouldWarm(job)
+    let settled = false
+
+    const spend = (u: Usage) => {
+      usage = addUsage(usage, u)
+    }
+
+    const pump = () => {
+      if (settled) return
+      if (signal.aborted) {
+        for (const i of queue) rows[i] = { id: job.items[i]!.id, ok: false, error: 'cancelled', attempts: attempts[i]! }
+        queue.length = 0
+      }
+      while (queue.length > 0 && canStart(callInFlight, sessionInFlight, warming ? 1 : config.concurrency, config.concurrency)) {
+        const i = queue.shift()!
+        attempts[i]!++
+        requests++
+        callInFlight++
+        sessionInFlight++
+        void attempt($, job, i, attempts[i]!, signal, spend)
+          .then(
+            o => {
+              if ('row' in o) rows[i] = o.row
+              else queue.push(i)
+            },
+            err => {
+              rows[i] = { id: job.items[i]!.id, ok: false, error: `failed: ${err instanceof Error ? err.message : String(err)}`, attempts: attempts[i]! }
+            },
+          )
+          .finally(() => {
+            callInFlight--
+            sessionInFlight--
+            warming = false
+            pump()
+            for (const other of [...pumps]) if (other !== pump) other()
+          })
+      }
+      if (queue.length === 0 && callInFlight === 0) {
+        settled = true
+        pumps.delete(pump)
+        const done = rows.map((r, i) => r ?? { id: job.items[i]!.id, ok: false as const, error: 'cancelled', attempts: attempts[i]! })
+        resolve({ tool: job.tool, format: job.format, model: job.model, ms: Date.now() - started, requests, usage, rows: done })
+      }
+    }
+
+    pumps.add(pump)
+    pump()
+  })
 }
 
 /** The result text, spilling the full rows to a file when they don't fit. */

@@ -163,7 +163,25 @@ describe('complete', () => {
     expect(text).toContain('2\tFAILED\treply fails the schema: $.n is string, expected integer')
   })
 
-  test('runs at most `concurrency` requests at once, across calls', { options: { concurrency: 2 } }, async ($, on) => {
+  test('one call runs at most `concurrency` requests at once', { options: { concurrency: 2 } }, async ($, on) => {
+    const clock = mock.clock(on)
+    let inFlight = 0
+    let peak = 0
+    world(on, async () => {
+      inFlight++
+      peak = Math.max(peak, inFlight)
+      await clock.sleep(100)
+      inFlight--
+      return answer('done')
+    })
+    await start($)
+    const a = complete($, { instructions: 'x', items: ['1', '2', '3', '4', '5', '6'] })
+    for (let i = 0; i < 3; i++) await clock.advance(100)
+    expect(peak).toBe(2)
+    expect((await a).result as string).toContain('6 ok')
+  })
+
+  test('the session cap lowers a call\'s parallelism but never stops it: each call keeps one request going', { options: { concurrency: 2 } }, async ($, on) => {
     const clock = mock.clock(on)
     let inFlight = 0
     let peak = 0
@@ -177,11 +195,16 @@ describe('complete', () => {
     await start($)
     const a = complete($, { instructions: 'x', items: ['1', '2', '3'] })
     const b = complete($, { instructions: 'x', items: ['4', '5', '6'] })
+    const c = complete($, { instructions: 'x', items: ['7'] })
+    await clock.settle()
+    // a takes both slots; b and c still start one each rather than waiting in hook-owned time.
+    expect(inFlight).toBe(4)
     for (let i = 0; i < 6; i++) await clock.advance(100)
-    const [ra, rb] = await Promise.all([a, b])
-    expect(peak).toBe(2)
+    const [ra, rb, rc] = await Promise.all([a, b, c])
+    expect(peak).toBe(4)
     expect(ra.result as string).toContain('3 ok')
     expect(rb.result as string).toContain('3 ok')
+    expect(rc.result as string).toContain('1 ok')
   })
 
   test('a large result spills to a JSONL file under TMPDIR', { options: { inlineResultChars: 1000 } }, async ($, on) => {
