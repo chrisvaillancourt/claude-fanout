@@ -1,0 +1,13 @@
+{
+  "name": "fanout",
+  "owner": {
+    "name": "Chris Vaillancourt"
+  },
+  "plugins": [
+    {
+      "name": "fanout",
+      "source": "./"
+    }
+  ],
+  "description": "Runs many small one-shot completions or classifications on a cheap model in parallel, as one tool call instead of a subagent per item."
+}
