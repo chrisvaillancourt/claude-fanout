@@ -61,7 +61,8 @@ Tool loading. The two tools are deferred behind ToolSearch by default, so each r
 - No background runs or resume: a call runs to the end inside its tool call. A hot reload or Esc cancels it.
 - No `jevify`-style keyword or frozen-rubric workflow; the tool descriptions carry the guidance.
 - Retries are immediate (queued behind the remaining items), with no backoff, so a sustained rate limit fails items rather than waiting.
-- The spill file is written with default permissions under the temp directory and is not cleaned up by the mod.
+- The spill file is written with default permissions under the temp directory and is not cleaned up by the mod. One file holds at most 4 MiB (the engine's write limit); a bigger result is reported as a failed spill with the rows that fit inline.
+- Cancelling with Esc is wired to the tool call's abort signal but has not been checked in a live interactive session yet.
 
 ## Install
 
