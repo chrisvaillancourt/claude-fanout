@@ -18,9 +18,13 @@ A subagent starts by loading a system prompt, tool schemas, CLAUDE.md and memory
 
 ### What it costs
 
-Every item is at least one request to the configured model, billed to your Claude Code credentials: up to `maxItems × 2` requests per call when every item is retried. Each request is the shared block plus one item plus the reply (`maxTokens` caps it; classify uses a smaller cap). The shared block is marked for caching, so items after the first can read it at a tenth of the input price, but only if the block is longer than the model's cache minimum (about a thousand tokens or more, depending on the model); short instructions are not cached and are paid in full on every item. These completions are not part of the session's own cost total in `/cost`; `/fanout` shows what they used.
+Every item is at least one request to the configured model, billed to your Claude Code credentials: up to `maxItems × 2` requests per call when every item is retried. Each request is the shared block plus one item plus the reply (`maxTokens` caps it; classify uses a smaller cap). These completions are not part of the session's own cost total in `/cost`; `/fanout` shows what they used.
 
-The two tools are deferred behind ToolSearch by default, so they add only their names to each request until the model loads them. Set `alwaysLoaded` to put their full schemas in every request instead, which makes the model more likely to reach for them unprompted.
+Measured on Claude Code 2.1.310 with Haiku 5.5: classifying 10 short messages with reasons took 10 requests and 3,562 tokens (356 per item, 1.6 s); extracting JSON from 3 sentences took 281 tokens per item.
+
+The prompt cache. The shared block is marked for caching, so later items can read it at a tenth of the input price, but only when the block is longer than the model's cache minimum (on the order of a thousand tokens); short instructions are not cached and are paid in full on every item, as in the numbers above. Requests that start at the same time can't read each other's cache: in a live check, three parallel requests over a 13.6K-token block each wrote it, and only the requests after them read it. So when the shared block is 4,000 characters or longer, the first item runs alone and the rest start once it has answered, at the cost of one request's latency.
+
+Tool loading. The two tools are deferred behind ToolSearch by default, so each request carries only their names until the model loads them (one ToolSearch call). Set `alwaysLoaded` to put both full schemas in every request instead: about 1,000 more input tokens per request (34,647 vs 35,643 on a one-word headless run), which makes the model more likely to reach for them unprompted. Deferred is the default because most sessions never call them, and those tokens would ride along on every request in the main conversation.
 
 ### What it never does
 

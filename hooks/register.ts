@@ -15,6 +15,7 @@ import {
   isRetryable,
   parseArgs,
   parseReply,
+  shouldWarm,
   statusOf,
   statusText,
   totalTokens,
@@ -135,8 +136,9 @@ async function runJob($: EngineInterface, job: Job, signal: AbortSignal): Promis
   let usage: Usage = ZERO
   let requests = 0
 
-  const worker = async () => {
-    for (;;) {
+  // `once`: take one item and stop (the warm-up request).
+  const worker = async (once = false) => {
+    for (let taken = 0; !(once && taken > 0); taken++) {
       const i = queue.shift()
       if (i === undefined) return
       await acquire()
@@ -183,7 +185,9 @@ async function runJob($: EngineInterface, job: Job, signal: AbortSignal): Promis
     }
   }
 
-  await Promise.all(Array.from({ length: Math.min(config.concurrency, job.items.length) }, worker))
+  // Parallel cold requests each write the cache; one request first lets the rest read it.
+  if (shouldWarm(job)) await worker(true)
+  await Promise.all(Array.from({ length: Math.min(config.concurrency, job.items.length) }, () => worker()))
   const done = rows.map((r, i) => r ?? { id: job.items[i]!.id, ok: false as const, error: 'cancelled', attempts: attempts[i]! })
   return { tool: job.tool, model: job.model, ms: Date.now() - started, requests, usage, rows: done }
 }

@@ -249,3 +249,35 @@ describe('timeouts', () => {
 })
 
 const ZERO_USAGE = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+
+describe('prompt cache warm-up', () => {
+  test('with a long shared block the first item runs alone, so the others can read its cache', async ($, on) => {
+    const clock = mock.clock(on)
+    const seen = world(on, async () => {
+      await clock.sleep(100)
+      return answer('done')
+    })
+    await start($)
+    const call = complete($, { instructions: 'Rule. '.repeat(1000), items: ['1', '2', '3'] })
+    await clock.settle()
+    expect(seen.requests).toHaveLength(1)
+    await clock.advance(100)
+    expect(seen.requests).toHaveLength(3)
+    await clock.advance(100)
+    expect((await call).result as string).toContain('3 ok')
+  })
+
+  test('with a short shared block every item starts at once', async ($, on) => {
+    const clock = mock.clock(on)
+    const seen = world(on, async () => {
+      await clock.sleep(100)
+      return answer('done')
+    })
+    await start($)
+    const call = complete($, { instructions: 'Short.', items: ['1', '2', '3'] })
+    await clock.settle()
+    expect(seen.requests).toHaveLength(3)
+    await clock.advance(100)
+    await call
+  })
+})

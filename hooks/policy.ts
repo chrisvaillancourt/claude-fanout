@@ -300,6 +300,18 @@ export function buildPrompt(job: Job, item: Item): Prompt {
   return { system: SYSTEM, prompt: [{ text: shared, cache: true }, { text: `<item>\n${escapeItem(item.text)}\n</item>` }] }
 }
 
+/**
+ * Below about this many characters the shared block is under every model's
+ * cache minimum (1024 tokens or more), so a warm-up request only adds latency.
+ */
+export const WARM_MIN_CHARS = 4000
+
+/** Run the first item alone when the shared block is long enough to cache. */
+export function shouldWarm(job: Job): boolean {
+  const first = job.items[0]
+  return job.items.length > 1 && first !== undefined && buildPrompt(job, first).prompt[0]!.text.length >= WARM_MIN_CHARS
+}
+
 // ---------------------------------------------------------------- replies
 
 export type Parsed = { ok: true; value: unknown; reason?: string } | { ok: false; error: string }
