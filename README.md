@@ -58,11 +58,11 @@ Tool loading. The two tools are deferred behind ToolSearch by default, so each r
 - Items are passed inline, so their text enters the conversation once, as the tool call's input. There is no file input: a tool that reads files on the model's behalf would sidestep the session's Read permissions. A later version could add it, gated on the session allowing a Read of the same path (`$.tool.check`).
 - JSON output is prompted and then checked locally against a schema subset (`type`, `properties`, `required`, `items`, `enum`, `additionalProperties: false`, `description`); other keywords are refused. Object members are checked as own JSON members (`constructor` or `__proto__` keys get no special treatment) and `enum` compares JSON structurally (object member order doesn't matter). There is no forced-tool structured output.
 - No per-label confidence: the model names a label, it doesn't give probabilities.
-- No background runs or resume: a call runs to the end inside its tool call. A hot reload or Esc cancels it.
+- No background runs or resume: a call runs to the end inside its tool call, and Esc cancels it. On Claude Code 2.1.310 a hot reload (saving a file in a `--plugin-dir` folder) was held until the turn ended, so the running call completed; `/reload-plugins` typed during the call ran after the turn.
 - No `jevify`-style keyword or frozen-rubric workflow; the tool descriptions carry the guidance.
 - Retries are immediate (queued behind the remaining items), with no backoff, so a sustained rate limit fails items rather than waiting.
 - The spill file is written with default permissions under the temp directory and is not cleaned up by the mod. One file holds at most 4 MiB (the engine's write limit); a bigger result is reported as a failed spill with the rows that fit inline.
-- Cancelling with Esc is wired to the tool call's abort signal but has not been checked in a live interactive session yet.
+- Cancelling with Esc was checked in a live interactive session on 2.1.310: Esc 10 s into a 40-item call aborted the eight running requests, the 32 unstarted or cut items came back as `cancelled` (counted under failed in the summary line), and the session went on normally. Esc pressed while the model is still writing the call's input cancels the call before the tool runs.
 
 ## Install
 
