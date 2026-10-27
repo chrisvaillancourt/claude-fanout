@@ -3,6 +3,11 @@ import type { EngineInterface, ModelCompleteResult, Register } from 'claude-code
 
 import {
   EMPTY_SESSION,
+  RUN_FLUSH_MS,
+  RUN_PREFIX,
+  RUN_TTL_MS,
+  SESSION_PREFIX,
+  SESSION_TTL_MS,
   USAGE,
   ZERO,
   addUsage,
@@ -12,6 +17,12 @@ import {
   describeFailure,
   formatResult,
   isActive,
+  isEmptySession,
+  isStale,
+  lostRunNotice,
+  runsFromRecord,
+  sessionFromRecord,
+  withLostRuns,
   isRetryable,
   parseArgs,
   canStart,
@@ -24,7 +35,7 @@ import {
   validateComplete,
 } from './policy'
 import type { Failure, Job, Row, Run } from './policy'
-import type { Config, Usage } from '../types'
+import type { Config, RunEntry, RunRecord, Session, SessionRecord, Usage } from '../types'
 
 const COMPLETE = 'mcp__fanout__complete'
 const CLASSIFY = 'mcp__fanout__classify'
@@ -32,6 +43,9 @@ const CLASSIFY = 'mcp__fanout__classify'
 // Change the shape tag when Session's fields change: a value an older version
 // stored (it outlives a hot reload) then reads as EMPTY_SESSION instead of breaking.
 const sessionAtom = atom({ plugin: 'fanout', key: 'session' } as const, EMPTY_SESSION, { shape: 'session-2' })
+// False until session.start has run in this process for this session: $.state survives a
+// hot reload but not a new process, so false at session.start means a new process.
+const liveAtom = atom({ plugin: 'fanout', key: 'live' } as const, false)
 
 // Module variables reset on a hot reload; register and session.start run
 // again then, and the engine aborts any completion still running.
@@ -47,12 +61,132 @@ let sessionInFlight = 0
 // Each running call's pump, woken when another call's request ends and frees a slot.
 const pumps = new Set<() => void>()
 
+// Batches in flight in this process, by run number, with the session each belongs to.
+// `run/<session id>` in $.store mirrors them so a new process can report the ones it lost.
+const liveRuns = new Map<number, { sid: string; entry: RunEntry }>()
+let nextRunId = 0
+// When each session's run record was last written, for the once-a-second throttle.
+const runFlushedAt = new Map<string, number>()
+// Store writes go one at a time, in order, so a late progress write can't land after the delete.
+let storeQueue: Promise<void> = Promise.resolve()
+
 /** Best effort: reporting must never throw out of a hook. */
 function log($: EngineInterface, text: string) {
   try {
     $.ui.log(text)
   } catch {
     // nothing to do
+  }
+}
+
+/** Runs `task` after every store write queued before it. Best effort: a failure is swallowed. */
+function queueStore(task: () => Promise<void>): Promise<void> {
+  storeQueue = storeQueue.then(task).catch(() => undefined)
+  return storeQueue
+}
+
+async function sessionIdOrNull($: EngineInterface): Promise<string | null> {
+  try {
+    return await $.session.id()
+  } catch {
+    return null
+  }
+}
+
+/** Writes the session's override and totals through to `session/<id>`, or drops the record when there's nothing to keep. */
+function saveSession($: EngineInterface, s: Session): Promise<void> {
+  return queueStore(async () => {
+    const sid = await $.session.id()
+    if (isEmptySession(s)) {
+      await $.store.delete(SESSION_PREFIX + sid)
+      return
+    }
+    const record: SessionRecord = { ...s, at: await $.clock.now() }
+    await $.store.set(SESSION_PREFIX + sid, record)
+  })
+}
+
+/** Updates the session atom and writes the result through. */
+async function changeSession($: EngineInterface, change: (s: Session) => Session): Promise<void> {
+  const next = await update($, sessionAtom, change)
+  await saveSession($, next)
+}
+
+/** Writes `run/<sid>` from this process's batches in flight for `sid`; deletes it when none are left. */
+async function writeRuns($: EngineInterface, sid: string) {
+  const runs = [...liveRuns.values()].filter(r => r.sid === sid).map(r => r.entry)
+  if (runs.length === 0) {
+    runFlushedAt.delete(sid)
+    await $.store.delete(RUN_PREFIX + sid)
+    return
+  }
+  const at = await $.clock.now()
+  runFlushedAt.set(sid, at)
+  const record: RunRecord = { at, runs }
+  await $.store.set(RUN_PREFIX + sid, record)
+}
+
+function flushRuns($: EngineInterface, sid: string): Promise<void> {
+  return queueStore(() => writeRuns($, sid))
+}
+
+/** A request of a batch finished: write its progress, at most once every RUN_FLUSH_MS. */
+function flushRunsThrottled($: EngineInterface, sid: string): void {
+  void queueStore(async () => {
+    const last = runFlushedAt.get(sid)
+    if (last !== undefined && (await $.clock.now()) - last < RUN_FLUSH_MS) return
+    await writeRuns($, sid)
+  })
+}
+
+/**
+ * In a new process (session.start with `live` unset): restore the override and totals the
+ * old process wrote, and report any batch it was running, whose results are gone. Its spend
+ * is added to the totals; it is not rerun.
+ */
+async function recover($: EngineInterface) {
+  const sid = await sessionIdOrNull($)
+  if (sid === null) return
+  let saved: Session | null = null
+  let lost: RunEntry[] = []
+  try {
+    saved = sessionFromRecord(await $.store.get(SESSION_PREFIX + sid))
+    const runRecord = await $.store.get(RUN_PREFIX + sid)
+    if (runRecord !== undefined) {
+      lost = runsFromRecord(runRecord) ?? []
+      await $.store.delete(RUN_PREFIX + sid)
+    }
+  } catch {
+    // Best effort: a broken store leaves the session as a fresh one.
+  }
+  if (!saved && lost.length === 0) return
+  try {
+    await changeSession($, s => withLostRuns(isEmptySession(s) && saved ? saved : s, lost))
+  } catch {
+    // Totals are reporting.
+  }
+  if (lost.length === 0) return
+  for (const r of lost) log($, lostRunNotice(r))
+  try {
+    $.ui.toast(lost.length === 1 ? 'a restart cut off a fanout batch; see the log' : `a restart cut off ${lost.length} fanout batches; see the log`)
+  } catch {
+    // Best effort.
+  }
+}
+
+/** Drops this plugin's session and run records past their TTL (or unreadable), whatever session left them. */
+async function pruneRecords($: EngineInterface) {
+  try {
+    const now = await $.clock.now()
+    for (const key of await $.store.keys()) {
+      const ttl = key.startsWith(SESSION_PREFIX) ? SESSION_TTL_MS : key.startsWith(RUN_PREFIX) ? RUN_TTL_MS : null
+      if (ttl === null) continue
+      const v = await $.store.get(key)
+      const readable = key.startsWith(SESSION_PREFIX) ? sessionFromRecord(v) !== null : runsFromRecord(v) !== null
+      if (!readable || isStale(v, now, ttl)) await $.store.delete(key)
+    }
+  } catch {
+    // Best effort.
   }
 }
 
@@ -152,7 +286,7 @@ async function attempt($: EngineInterface, job: Job, i: number, tries: number, s
 }
 
 /** Runs every item of `job`; each item settles to exactly one row. Never waits outside a `$` call. */
-function runJob($: EngineInterface, job: Job, signal: AbortSignal): Promise<Run> {
+function runJob($: EngineInterface, job: Job, signal: AbortSignal, onRequest: (u: Usage) => void = () => undefined): Promise<Run> {
   return new Promise(resolve => {
     const started = Date.now()
     const rows: (Row | undefined)[] = job.items.map(() => undefined)
@@ -167,6 +301,7 @@ function runJob($: EngineInterface, job: Job, signal: AbortSignal): Promise<Run>
 
     const spend = (u: Usage) => {
       usage = addUsage(usage, u)
+      onRequest(u)
     }
 
     const pump = () => {
@@ -235,10 +370,44 @@ async function serve($: EngineInterface, e: Record<string, unknown>, signal: Abo
   const checked = tool === 'complete' ? validateComplete(e, config) : validateClassify(e, config)
   if (!checked.ok) return { deny: `fanout ${tool} refused, nothing was sent: ${checked.error}` }
 
-  const run = await runJob($, checked.job, signal)
+  const job = checked.job
+  const sid = await sessionIdOrNull($)
+  const runId = ++nextRunId
+  const entry: RunEntry = { tool, items: job.items.length, startedAt: 0, requests: 0, usage: ZERO }
+  let run: Run
+  try {
+    if (sid !== null) {
+      try {
+        entry.startedAt = await $.clock.now()
+      } catch {
+        // Best effort: the record is still useful without its start time.
+      }
+      liveRuns.set(runId, { sid, entry })
+      await flushRuns($, sid)
+    }
+    run = await runJob($, job, signal, u => {
+      entry.requests++
+      entry.usage = addUsage(entry.usage, u)
+      if (sid !== null) flushRunsThrottled($, sid)
+    })
+    await countRun($, run)
+  } finally {
+    // Forgotten after the totals are written: a restart in between counts the spend twice rather than not at all.
+    liveRuns.delete(runId)
+    if (sid !== null) await flushRuns($, sid)
+  }
+  const c = countRows(run.rows)
+  log($, `${tool} ${statusOf(c)}: ${c.items} items, ${c.ok} ok, ${c.failed} failed, ${c.retried} retried; ` +
+    `${run.requests} requests, ${totalTokens(run.usage)} tokens (${run.usage.input_tokens} in, ${run.usage.cache_read_input_tokens} cache read, ` +
+    `${run.usage.cache_creation_input_tokens} cache write, ${run.usage.output_tokens} out), ${run.model}, ${run.ms}ms`)
+  return { result: await finish($, run) }
+}
+
+/** Adds a finished call to the session totals. */
+async function countRun($: EngineInterface, run: Run) {
   const c = countRows(run.rows)
   try {
-    await update($, sessionAtom, s => ({
+    await changeSession($, s => ({
       ...s,
       calls: s.calls + 1,
       items: s.items + c.items,
@@ -251,10 +420,6 @@ async function serve($: EngineInterface, e: Record<string, unknown>, signal: Abo
   } catch {
     // Totals are reporting; the result still goes back.
   }
-  log($, `${tool} ${statusOf(c)}: ${c.items} items, ${c.ok} ok, ${c.failed} failed, ${c.retried} retried; ` +
-    `${run.requests} requests, ${totalTokens(run.usage)} tokens (${run.usage.input_tokens} in, ${run.usage.cache_read_input_tokens} cache read, ` +
-    `${run.usage.cache_creation_input_tokens} cache write, ${run.usage.output_tokens} out), ${run.model}, ${run.ms}ms`)
-  return { result: await finish($, run) }
 }
 
 export const register: Register = (on, options) => {
@@ -267,13 +432,29 @@ export const register: Register = (on, options) => {
       description: 'Show fanout totals for this session, or turn its tools on or off',
       argumentHint: '[status|on|off]',
     })
+    // A new process: put back what the old one kept, before deciding on the tools.
+    let isLive = true
+    try {
+      isLive = await read($, liveAtom)
+    } catch {
+      // Unknown: treat as a hot reload, which never reports.
+    }
+    if (!isLive) {
+      await recover($)
+      try {
+        await update($, liveAtom, () => true)
+      } catch {
+        // Best effort.
+      }
+    }
+    await pruneRecords($)
     if (isActive(config, await read($, sessionAtom))) await registerTools($)
     return next(e)
   })
 
   on('session.end', async ($, e, next) => {
     // /clear starts a new conversation in the same process: its totals start at zero.
-    if (e.reason === 'clear') await update($, sessionAtom, s => ({ ...EMPTY_SESSION, mode: s.mode }))
+    if (e.reason === 'clear') await changeSession($, s => ({ ...EMPTY_SESSION, mode: s.mode }))
     return next(e)
   })
 
@@ -281,7 +462,7 @@ export const register: Register = (on, options) => {
     const cmd = parseArgs(e.args)
     if (cmd.kind === 'help') return { text: cmd.error ? `${cmd.error}\n${USAGE}` : USAGE }
     if (cmd.kind === 'set') {
-      await update($, sessionAtom, s => ({ ...s, mode: cmd.mode }))
+      await changeSession($, s => ({ ...s, mode: cmd.mode }))
       if (cmd.mode === 'on' && !registered) await registerTools($)
     }
     return { text: statusText(config, await read($, sessionAtom)) }

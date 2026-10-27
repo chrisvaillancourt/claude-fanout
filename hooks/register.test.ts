@@ -8,8 +8,33 @@ type Reply = (e: ModelCompleteInput, n: number) => ModelCompleteResult | Promise
 const answer = (text: string): ModelCompleteResult => ({ isAnswered: true, text, usage: USAGE })
 
 /** The engine beneath the plugin, with a model that answers by `reply` and records every request. */
-function world(on: On, reply: Reply, opts: { failWrite?: boolean } = {}) {
-  const seen = { requests: [] as ModelCompleteInput[], tools: [] as { name: string; isDeferred?: boolean }[], writes: [] as { path: string; text: string }[], commands: [] as string[], logs: [] as string[] }
+function world(on: On, reply: Reply, opts: { failWrite?: boolean; store?: Record<string, unknown>; failStore?: boolean } = {}) {
+  const seen = {
+    requests: [] as ModelCompleteInput[], tools: [] as { name: string; isDeferred?: boolean }[], writes: [] as { path: string; text: string }[],
+    commands: [] as string[], logs: [] as string[], toasts: [] as string[], notifies: [] as string[],
+    // The store as a map the test can read back.
+    store: new Map<string, unknown>(Object.entries(opts.store ?? {})),
+  }
+  on('store.get', ($, e) => (opts.failStore ? { deny: 'store broken' } : { value: seen.store.get(e.key) }))
+  on('store.set', ($, e) => {
+    if (opts.failStore) return { deny: 'store broken' }
+    seen.store.set(e.key, JSON.parse(JSON.stringify(e.value)))
+    return { value: undefined }
+  })
+  on('store.delete', ($, e) => {
+    if (opts.failStore) return { deny: 'store broken' }
+    seen.store.delete(e.key)
+    return { value: undefined }
+  })
+  on('store.keys', () => (opts.failStore ? { deny: 'store broken' } : { value: [...seen.store.keys()] }))
+  on('ui.toast', ($, e) => {
+    seen.toasts.push(e.text)
+    return { value: undefined }
+  })
+  on('ui.notify', ($, e) => {
+    seen.notifies.push(e.text)
+    return { value: { isSent: true as const, channel: 'terminal_bell' as const } }
+  })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('session.id', () => ({ value: 'sess-1' }))
@@ -314,5 +339,153 @@ describe('prompt cache warm-up', () => {
     expect(seen.requests).toHaveLength(3)
     await clock.advance(100)
     await call
+  })
+})
+
+describe('what survives a restart', () => {
+  const T0 = 1_800_000_000_000
+  const DAY = 24 * 60 * 60 * 1000
+  const SAVED = {
+    mode: 'off', calls: 2, items: 5, ok: 4, failed: 1, retried: 1, requests: 6,
+    usage: { input_tokens: 600, output_tokens: 30, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, at: T0 - DAY,
+  }
+  const LOST = { at: T0 - 60_000, runs: [{ tool: 'classify', items: 40, startedAt: T0 - 120_000, requests: 12, usage: { input_tokens: 1000, output_tokens: 200, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }] }
+
+  test('a new process restores /fanout off and the totals', async ($, on) => {
+    mock.clock(on, { now: T0 })
+    const seen = world(on, () => answer('ham'), { store: { 'session/sess-1': SAVED } })
+    await start($)
+    expect(seen.tools).toEqual([])
+    const s = await $.command.run({ command: 'fanout', args: '', ...COMMAND })
+    expect(s.text).toContain('off (set for this session)')
+    expect(s.text).toContain('2 calls, 5 items (4 ok, 1 failed, 1 retried), 6 requests')
+    expect(seen.logs).toEqual([])
+  })
+
+  test('a new process reports a batch the restart cut off, counts its spend, and does not rerun it', async ($, on) => {
+    mock.clock(on, { now: T0 })
+    const seen = world(on, () => answer('ham'), { store: { 'run/sess-1': LOST } })
+    await start($)
+    expect(seen.logs).toEqual(['a restart cut off a fanout classify batch of 40 items after ~1200 tokens; its results were lost'])
+    expect(seen.toasts).toHaveLength(1)
+    expect(seen.notifies).toEqual([])
+    expect(seen.requests).toHaveLength(0)
+    expect(seen.store.get('run/sess-1')).toBeUndefined()
+    const s = await $.command.run({ command: 'fanout', args: '', ...COMMAND })
+    expect(s.text).toContain('0 calls, 0 items (0 ok, 0 failed, 0 retried), 12 requests')
+    expect(s.text).toContain('1000 input')
+    expect((seen.store.get('session/sess-1') as { requests: number }).requests).toBe(12)
+  })
+
+  test('a hot reload neither reports nor double-counts', async ($, on) => {
+    mock.clock(on, { now: T0 })
+    const seen = world(on, () => answer('ham'))
+    await start($)
+    await classify($, { instructions: 'x', labels: ['spam', 'ham'], items: ['a'] })
+    seen.store.set('run/sess-1', LOST)
+    await start($)
+    expect(seen.logs.filter(l => /restart/.test(l))).toEqual([])
+    expect(seen.toasts).toEqual([])
+    expect(seen.store.get('run/sess-1')).toEqual(LOST)
+    const s = await $.command.run({ command: 'fanout', args: '', ...COMMAND })
+    expect(s.text).toContain('1 calls, 1 items (1 ok, 0 failed, 0 retried), 1 requests')
+  })
+
+  test('a running batch is recorded, and forgotten when it ends; the totals are written through', async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    const seen = world(on, async () => {
+      await clock.sleep(1000)
+      return answer('ham')
+    }, {})
+    await start($)
+    const call = classify($, { instructions: 'x', labels: ['spam', 'ham'], items: ['a', 'b', 'c'] })
+    await clock.settle()
+    expect(seen.store.get('run/sess-1')).toEqual({
+      at: T0, runs: [{ tool: 'classify', items: 3, startedAt: T0, requests: 0, usage: ZERO_USAGE }],
+    })
+    await clock.advance(1000)
+    await call
+    expect(seen.store.get('run/sess-1')).toBeUndefined()
+    expect(seen.store.get('session/sess-1')).toMatchObject({ calls: 1, items: 3, ok: 3, requests: 3, mode: null })
+  })
+
+  test('the record carries usage while later attempts are still running', { options: { concurrency: 1 } }, async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    const seen = world(on, async () => {
+      await clock.sleep(2000)
+      return answer('ham')
+    })
+    await start($)
+    const call = classify($, { instructions: 'x', labels: ['spam', 'ham'], items: ['a', 'b', 'c'] })
+    await clock.settle()
+    await clock.advance(2000)
+    await clock.settle()
+    expect(seen.store.get('run/sess-1')).toMatchObject({ runs: [{ tool: 'classify', items: 3, requests: 1, usage: USAGE }] })
+    await clock.advance(4000)
+    await call
+    expect(seen.store.get('run/sess-1')).toBeUndefined()
+  })
+
+  test('/fanout off is written through, and /clear takes the record with the state', async ($, on) => {
+    mock.clock(on, { now: T0 })
+    const seen = world(on, () => answer('ham'))
+    await start($)
+    expect(seen.store.get('session/sess-1')).toBeUndefined()
+    await $.command.run({ command: 'fanout', args: 'off', ...COMMAND })
+    expect(seen.store.get('session/sess-1')).toMatchObject({ mode: 'off', calls: 0, at: T0 })
+    await $.session.end({ reason: 'clear', sessionId: 'sess-1', resume: { id: 'sess-1' } } as any)
+    expect(seen.store.get('session/sess-1')).toMatchObject({ mode: 'off', calls: 0 })
+    await $.command.run({ command: 'fanout', args: 'on', ...COMMAND })
+    expect(seen.store.get('session/sess-1')).toMatchObject({ mode: 'on' })
+  })
+
+  test('/clear with no override drops the record', async ($, on) => {
+    mock.clock(on, { now: T0 })
+    const seen = world(on, () => answer('ham'))
+    await start($)
+    await classify($, { instructions: 'x', labels: ['spam', 'ham'], items: ['a'] })
+    expect(seen.store.get('session/sess-1')).toBeDefined()
+    await $.session.end({ reason: 'clear', sessionId: 'sess-1', resume: { id: 'sess-1' } } as any)
+    expect(seen.store.get('session/sess-1')).toBeUndefined()
+  })
+
+  test('other sessions\' records are left alone; stale ones and unreadable ones are pruned', async ($, on) => {
+    mock.clock(on, { now: T0 })
+    const seen = world(on, () => answer('ham'), {
+      store: {
+        'session/other': { ...SAVED, at: T0 - 29 * DAY },
+        'session/old': { ...SAVED, at: T0 - 31 * DAY },
+        'run/other': { ...LOST, at: T0 - 6 * DAY },
+        'run/old': { ...LOST, at: T0 - 8 * DAY },
+        'run/junk': { nope: true },
+        unrelated: { at: 0 },
+      },
+    })
+    await start($)
+    expect([...seen.store.keys()].sort()).toEqual(['run/other', 'session/other', 'unrelated'])
+    expect(seen.logs).toEqual([])
+  })
+
+  test('a record from another version or a corrupted one is ignored', async ($, on) => {
+    mock.clock(on, { now: T0 })
+    const seen = world(on, () => answer('ham'), { store: { 'session/sess-1': { mode: 'sideways', calls: 'x', at: T0 }, 'run/sess-1': { at: T0, runs: [{ tool: 'x' }] } } })
+    await start($)
+    expect(seen.tools).toHaveLength(2)
+    expect(seen.logs).toEqual([])
+    const s = await $.command.run({ command: 'fanout', args: '', ...COMMAND })
+    expect(s.text).toContain('0 calls, 0 items')
+  })
+
+  test('a broken store changes nothing about a call', async ($, on) => {
+    mock.clock(on, { now: T0 })
+    const seen = world(on, () => answer('ham'), { failStore: true })
+    await start($)
+    expect(seen.tools).toHaveLength(2)
+    const r = await classify($, { instructions: 'x', labels: ['spam', 'ham'], items: ['a', 'b'] })
+    expect(r.result as string).toContain('status ok: 2 items, 2 ok')
+    await $.command.run({ command: 'fanout', args: 'off', ...COMMAND })
+    const s = await $.command.run({ command: 'fanout', args: '', ...COMMAND })
+    expect(s.text).toContain('off (set for this session)')
+    expect(s.text).toContain('1 calls, 2 items')
   })
 })

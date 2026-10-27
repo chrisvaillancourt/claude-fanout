@@ -43,8 +43,35 @@ export type Session = {
   usage: Usage
 }
 
+/** `session/<session id>` in $.store: the Session, written through on every change, so a new process can restore it. */
+export type SessionRecord = Session & {
+  /** When it was last written ($.clock.now()); records untouched for 30 days are pruned. */
+  at: number
+}
+
+/** One batch in flight, as `run/<session id>` keeps it. */
+export type RunEntry = {
+  tool: 'complete' | 'classify'
+  items: number
+  startedAt: number
+  /** Requests finished so far, retries included. */
+  requests: number
+  /** Spend of the finished requests so far. */
+  usage: Usage
+}
+
+/** `run/<session id>` in $.store: the session's batches in flight (calls can overlap). Deleted when none are left. */
+export type RunRecord = {
+  at: number
+  runs: RunEntry[]
+}
+
 declare module 'claude-code' {
   interface PluginState {
-    'fanout': { session: Shaped<Session> }
+    'fanout': {
+      session: Shaped<Session>
+      /** Set at session.start: false in a new process (state doesn't cross one), true after a hot reload. */
+      live: boolean
+    }
   }
 }

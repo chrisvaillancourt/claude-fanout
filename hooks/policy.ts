@@ -1,5 +1,5 @@
 // Pure decisions: no `$`, no I/O. register.ts only wires these to events.
-import type { Config, Effort, Mode, Session, Usage } from '../types'
+import type { Config, Effort, Mode, RunEntry, Session, Usage } from '../types'
 
 export const ZERO: Usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 
@@ -84,6 +84,69 @@ export function statusText(config: Config, s: Session): string {
     `This session: ${s.calls} calls, ${s.items} items (${s.ok} ok, ${s.failed} failed, ${s.retried} retried), ${s.requests} requests.`,
     `Tokens: ${usageLine(s.usage, s.items, s.requests).replace(/, \d+ requests$/, '')}.`,
   ].join('\n')
+}
+
+// ---------------------------------------------------------------- persistence
+
+export const SESSION_PREFIX = 'session/'
+export const RUN_PREFIX = 'run/'
+const DAY_MS = 24 * 60 * 60 * 1000
+export const SESSION_TTL_MS = 30 * DAY_MS
+export const RUN_TTL_MS = 7 * DAY_MS
+/** Least time between two writes of a running batch's progress. */
+export const RUN_FLUSH_MS = 1000
+
+/** Nothing worth keeping: no override, nothing counted. */
+export function isEmptySession(s: Session): boolean {
+  return s.mode === null && s.calls === 0 && s.requests === 0 && totalTokens(s.usage) === 0
+}
+
+const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0
+
+function usageFrom(v: unknown): Usage | null {
+  if (!isObject(v)) return null
+  const { input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens } = v
+  if (![input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens].every(isCount)) return null
+  return { input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens } as Usage
+}
+
+/** The Session a `session/<id>` record holds, or null for anything that isn't one. */
+export function sessionFromRecord(v: unknown): Session | null {
+  if (!isObject(v)) return null
+  const mode = v.mode
+  if (mode !== null && mode !== 'on' && mode !== 'off') return null
+  const { calls, items, ok, failed, retried, requests } = v
+  if (![calls, items, ok, failed, retried, requests].every(isCount)) return null
+  const usage = usageFrom(v.usage)
+  if (!usage) return null
+  return { mode, calls, items, ok, failed, retried, requests, usage } as Session
+}
+
+/** The batches a `run/<id>` record holds, or null for anything that isn't one. */
+export function runsFromRecord(v: unknown): RunEntry[] | null {
+  if (!isObject(v) || !Array.isArray(v.runs)) return null
+  const runs: RunEntry[] = []
+  for (const r of v.runs) {
+    if (!isObject(r) || (r.tool !== 'complete' && r.tool !== 'classify')) return null
+    const usage = usageFrom(r.usage)
+    if (!usage || !isCount(r.items) || !isCount(r.startedAt) || !isCount(r.requests)) return null
+    runs.push({ tool: r.tool, items: r.items, startedAt: r.startedAt, requests: r.requests, usage })
+  }
+  return runs
+}
+
+/** Whether a record of either prefix is past its TTL at `now`, or has no readable `at`. */
+export function isStale(v: unknown, now: number, ttlMs: number): boolean {
+  return !isObject(v) || !isCount(v.at) || v.at < now - ttlMs
+}
+
+/** Totals with the spend of batches a restart cut off: their requests and tokens, not their items or calls. */
+export function withLostRuns(s: Session, runs: RunEntry[]): Session {
+  return runs.reduce((acc, r) => ({ ...acc, requests: acc.requests + r.requests, usage: addUsage(acc.usage, r.usage) }), s)
+}
+
+export function lostRunNotice(r: RunEntry): string {
+  return `a restart cut off a fanout ${r.tool} batch of ${r.items} items after ~${totalTokens(r.usage)} tokens; its results were lost`
 }
 
 // ---------------------------------------------------------------- validation

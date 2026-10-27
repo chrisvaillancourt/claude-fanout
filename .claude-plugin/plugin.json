@@ -1,6 +1,6 @@
 {
   "name": "fanout",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Runs many small one-shot completions or classifications on a cheap model in parallel, as one tool call instead of a subagent per item.",
   "types": "./types/index.d.ts",
   "userConfig": {
