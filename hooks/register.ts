@@ -26,7 +26,6 @@ import {
 import type { Failure, Job, Row, Run } from './policy'
 import type { Config, Usage } from '../types'
 
-const NAME = 'fanout'
 const COMPLETE = 'mcp__fanout__complete'
 const CLASSIFY = 'mcp__fanout__classify'
 
@@ -51,7 +50,7 @@ const pumps = new Set<() => void>()
 /** Best effort: reporting must never throw out of a hook. */
 function log($: EngineInterface, text: string) {
   try {
-    $.ui.log(`${NAME}: ${text}`)
+    $.ui.log(text)
   } catch {
     // nothing to do
   }

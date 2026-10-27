@@ -9,7 +9,7 @@ const answer = (text: string): ModelCompleteResult => ({ isAnswered: true, text,
 
 /** The engine beneath the plugin, with a model that answers by `reply` and records every request. */
 function world(on: On, reply: Reply, opts: { failWrite?: boolean } = {}) {
-  const seen = { requests: [] as ModelCompleteInput[], tools: [] as { name: string; isDeferred?: boolean }[], writes: [] as { path: string; text: string }[], commands: [] as string[] }
+  const seen = { requests: [] as ModelCompleteInput[], tools: [] as { name: string; isDeferred?: boolean }[], writes: [] as { path: string; text: string }[], commands: [] as string[], logs: [] as string[] }
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('session.id', () => ({ value: 'sess-1' }))
@@ -30,7 +30,10 @@ function world(on: On, reply: Reply, opts: { failWrite?: boolean } = {}) {
     seen.writes.push(e)
     return { value: undefined }
   })
-  on('ui.log', () => ({ value: undefined }))
+  on('ui.log', ($, e) => {
+    seen.logs.push(e.text)
+    return { value: undefined }
+  })
   mock.env(on, { TMPDIR: '/tmp/x/' })
   return seen
 }
@@ -69,6 +72,15 @@ describe('registration', () => {
 })
 
 describe('classify', () => {
+  test('the per-call log line carries no hand-written plugin-name prefix (the engine adds it)', async ($, on) => {
+    const seen = world(on, () => answer('ham'))
+    await start($)
+    await classify($, { instructions: 'Is it spam?', labels: ['spam', 'ham'], items: ['lunch at noon'] })
+    expect(seen.logs).toHaveLength(1)
+    expect(seen.logs[0]).toMatch(/^classify ok: 1 items, 1 ok, 0 failed, 0 retried; /)
+    expect(seen.logs[0]!.startsWith('fanout: ')).toBe(false)
+  })
+
   test('labels every item in order, with the shared block cached first', async ($, on) => {
     const seen = world(on, e => answer(itemOf(e).includes('pills') ? 'spam' : 'ham'))
     await start($)
