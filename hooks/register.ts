@@ -106,9 +106,22 @@ function saveSession($: EngineInterface, s: Session): Promise<void> {
   })
 }
 
-/** Updates the session atom and writes the result through. */
+/**
+ * Marks this session as running in this process. /clear starts a session id with empty
+ * state and no session.start, so session.start alone can't be what sets it.
+ */
+async function markLive($: EngineInterface) {
+  try {
+    await update($, liveAtom, () => true)
+  } catch {
+    // Best effort.
+  }
+}
+
+/** Updates the session atom, marks the session live, and writes the result through. */
 async function changeSession($: EngineInterface, change: (s: Session) => Session): Promise<void> {
   const next = await update($, sessionAtom, change)
+  await markLive($)
   await saveSession($, next)
 }
 
@@ -382,6 +395,7 @@ async function serve($: EngineInterface, e: Record<string, unknown>, signal: Abo
       } catch {
         // Best effort: the record is still useful without its start time.
       }
+      await markLive($)
       liveRuns.set(runId, { sid, entry })
       await flushRuns($, sid)
     }
@@ -441,11 +455,7 @@ export const register: Register = (on, options) => {
     }
     if (!isLive) {
       await recover($)
-      try {
-        await update($, liveAtom, () => true)
-      } catch {
-        // Best effort.
-      }
+      await markLive($)
     }
     await pruneRecords($)
     if (isActive(config, await read($, sessionAtom))) await registerTools($)
@@ -454,7 +464,9 @@ export const register: Register = (on, options) => {
 
   on('session.end', async ($, e, next) => {
     // /clear starts a new conversation in the same process: its totals start at zero.
-    if (e.reason === 'clear') await changeSession($, s => ({ ...EMPTY_SESSION, mode: s.mode }))
+    // Not written to the store: here $.session.id() is the ending session's, whose record
+    // should stay as it was; the new session id writes its own record on its first change.
+    if (e.reason === 'clear') await update($, sessionAtom, s => ({ ...EMPTY_SESSION, mode: s.mode }))
     return next(e)
   })
 
